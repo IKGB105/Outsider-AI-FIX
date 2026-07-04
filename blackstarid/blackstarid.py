@@ -18,6 +18,8 @@
 import usb.core
 import usb.util
 import logging
+import time
+import json
 import xml.etree.ElementTree as et
 
 # Set up logging and create a null handler in case the application doesn't
@@ -55,6 +57,16 @@ class NoDataAvailable(Exception):
 
     '''Raised when a read operation is called but no data is available
     from the amplifer.
+
+    '''
+    pass
+
+
+class AmpDisconnectedError(Exception):
+
+    '''Raised when a read or write operation fails because the
+    amplifier appears to have been physically disconnected (as
+    opposed to a normal read timeout, which raises NoDataAvailable).
 
     '''
     pass
@@ -152,7 +164,9 @@ class BlackstarIDAmpPreset(object):
         track = audio.find('Track')
         ps.track_repeat = int(track.attrib['Repeat'])
         ps.track = track.text
-    
+
+        return ps
+
     @classmethod
     def from_packet(cls, packet):
         # Check that the packet passed is actually a packet containing
@@ -231,6 +245,21 @@ class BlackstarIDAmpPreset(object):
 
         return ps
 
+    def to_settings_dict(self):
+        '''Return a dict of control name -> value for the controls this
+        preset has values for, suitable for passing as the
+        ``settings`` argument to BlackstarIDAmp.save_preset_settings().
+
+        '''
+        control_names = (
+            'voice', 'gain', 'volume', 'bass', 'middle', 'treble', 'isf',
+            'tvp_switch', 'tvp_valve',
+            'mod_switch', 'mod_type', 'mod_segval', 'mod_level', 'mod_speed', 'mod_manual',
+            'delay_switch', 'delay_type', 'delay_feedback', 'delay_level', 'delay_time',
+            'reverb_switch', 'reverb_type', 'reverb_size', 'reverb_level',
+        )
+        return {name: getattr(self, name) for name in control_names if hasattr(self, name)}
+
 # Implementation note regarding reading delay time info from the amp
 # when controls are changed on the amp:
 #
@@ -246,6 +275,19 @@ class BlackstarIDAmpPreset(object):
 #    has the form [0x03, 0x1b, 0x00, 0x01, A, ...] and the second has
 #    the form [0x03, 0x1c, 0x00, 0x02, B,...] and the delay time is
 #    (256*B)+A.
+
+
+
+# A neutral/flat starting point for a preset - clean voice, moderate
+# gain and EQ, all effects off. Used to reset a preset back to a
+# blank slate (see BlackstarIDAmp.save_preset_settings).
+DEFAULT_PRESET_SETTINGS = {
+    'voice': 0, 'gain': 64, 'volume': 64, 'bass': 64, 'middle': 64, 'treble': 64, 'isf': 64,
+    'tvp_switch': 0, 'tvp_valve': 0,
+    'mod_switch': 0, 'mod_type': 0, 'mod_segval': 0, 'mod_level': 0, 'mod_speed': 0, 'mod_manual': 0,
+    'delay_switch': 0, 'delay_type': 0, 'delay_feedback': 0, 'delay_level': 0, 'delay_time': 100,
+    'reverb_switch': 0, 'reverb_type': 0, 'reverb_size': 0, 'reverb_level': 0,
+}
 
 
 class BlackstarIDAmp(object):
@@ -323,6 +365,39 @@ class BlackstarIDAmp(object):
         'reverb_size': [0, 31],  # Segment value
         'reverb_level': [0, 127],
         'fx_focus': [1, 3],
+    }
+
+    # Byte offsets of each control's value within a preset settings
+    # packet (the packet returned in response to a preset query, and
+    # sent back to the amp to save a preset) - see
+    # BlackstarIDAmpPreset.from_packet for the packet layout this is
+    # derived from. 'delay_time' is handled separately since it spans
+    # two bytes (offsets 30 and 31).
+    preset_settings_offsets = {
+        'voice': 4,
+        'gain': 5,
+        'volume': 6,
+        'bass': 7,
+        'middle': 8,
+        'treble': 9,
+        'isf': 10,
+        'tvp_valve': 11,
+        'mod_level': 12,
+        'tvp_switch': 17,
+        'mod_switch': 18,
+        'delay_switch': 19,
+        'reverb_switch': 20,
+        'mod_type': 21,
+        'mod_segval': 22,
+        'mod_manual': 23,
+        'mod_speed': 25,
+        'delay_type': 26,
+        'delay_feedback': 27,
+        'delay_level': 29,
+        'reverb_type': 32,
+        'reverb_size': 33,
+        'reverb_level': 35,
+        'fx_focus': 39,
     }
 
     tuner_note = ['E', 'F', 'F#', 'G', 'G#', 'A',
@@ -450,6 +525,24 @@ class BlackstarIDAmp(object):
         self.interrupt_in = None
         self.interrupt_out = None
 
+    def reset_state(self):
+        '''Reset internal state to disconnected without attempting any
+        further communication with the device.
+
+        Use this instead of disconnect() when the amp has already
+        been found to be physically disconnected (e.g. after an
+        AmpDisconnectedError) - disconnect() assumes the device is
+        still present and able to respond, and will raise if it
+        isn't.
+
+        '''
+        self.connected = False
+        self.device = None
+        self.reattach_kernel = []
+        self.model = None
+        self.interrupt_in = None
+        self.interrupt_out = None
+
     def _send_data(self, data):
         '''Take a list of bytes and send it to endpoint'''
 
@@ -460,7 +553,11 @@ class BlackstarIDAmp(object):
                 'data length is {0} which is not 64'.format(data_length))
 
         # Write to endpoint, returning the number of bytes written
-        bytes_written = self.device.write(self.interrupt_out, data)
+        try:
+            bytes_written = self.device.write(self.interrupt_out, data)
+        except usb.core.USBError as e:
+            logger.error('Lost connection to amplifier while writing: {0}'.format(e))
+            raise AmpDisconnectedError(str(e))
 
         logger.debug("Data length {0}, bytes written {1}".format(data_length, bytes_written))
 
@@ -510,7 +607,7 @@ class BlackstarIDAmp(object):
 
         data = [0x00] * 64
 
-        if control is 'delay_time':
+        if control == 'delay_time':
             data[0:4] = [0x03, ctrl_byte, 0x00, 0x02]
             data[4] = value % 256
             data[5] = value // 256
@@ -570,13 +667,28 @@ class BlackstarIDAmp(object):
 
         self._send_data(data)
 
-    def get_all_preset_names(self):
-        '''Sends request packets requesting all preset names. No processing of
-        the returned packets is done.
+    def get_all_preset_names(self, delay=0.03):
+        '''Sends request packets requesting all preset names. No processing
+        of the returned packets is done here - that's left to whatever
+        is reading response packets (e.g. the amp watcher thread in
+        the GUI).
+
+        Requests are paced with a small delay between each one.
+        Firing all 128 requests back to back overflows the amp's
+        internal reply queue and most responses never come back - in
+        testing, sending them unpaced only returned ~17-25 of 128
+        names.
+
+        ``delay`` is the number of seconds to wait between each
+        request, and defaults to a value found to be reliable in
+        testing. Lowering it risks dropped responses; there's little
+        benefit to raising it since this only affects how long
+        connecting to the amp takes.
 
         '''
         for i in range(1, 129):
             self.get_preset_name(i)
+            time.sleep(delay)
 
     def set_preset_name(self, preset, name, handle_response=False):
         '''Set the name of the specified preset.
@@ -661,6 +773,152 @@ class BlackstarIDAmp(object):
                 raise RuntimeError(msg)
 
 
+    def save_preset_settings(self, preset, settings, name=None):
+        '''Save a set of control settings to a preset slot on the amplifier,
+        optionally (re)naming it at the same time.
+
+        ``preset`` must be an integer in the range 1..128
+
+        ``settings`` is a dict mapping control names (as used in the
+        ``controls`` dict) to the values they should be set to in the
+        preset. Controls not present in the dict are left unchanged.
+
+        ``name`` if given, is a string of no more than 21 characters
+        used to (re)name the preset. If omitted, the preset keeps its
+        existing name.
+
+        '''
+        if self.connected is False:
+            raise NotConnectedError
+
+        if preset not in range(1, 129):
+            msg = 'Preset number {0} out of range'.format(preset)
+            logger.error(msg)
+            raise ValueError(msg)
+
+        if name is not None and len(name) > 21:
+            msg = 'Name {0} is longer than 21 characters'.format(name)
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # Query the current preset settings packet from the amp so we
+        # have a correctly formed packet to start from, then overwrite
+        # the bytes for the controls we've been asked to change.
+        data = [0x00] * 64
+        data[0:4] = [0x02, 0x05, preset, 0x00]
+        self._send_data(data)
+        packet = self.device.read(self.interrupt_in, 64)
+
+        packet[1] = 0x03  # instead of 0x02
+        packet[3] = 0x29  # instead of 0x2a - weirdly inconsistent
+
+        for control, value in settings.items():
+            limits = self.control_limits[control]
+            if value not in range(limits[0], limits[1] + 1):
+                msg = 'Value {0} is not valid for control {1}'.format(
+                    value, control)
+                logger.error(msg)
+                raise ValueError(msg)
+
+            if control == 'delay_time':
+                packet[30] = value % 256
+                packet[31] = value // 256
+            else:
+                packet[self.preset_settings_offsets[control]] = value
+
+        if name is not None:
+            namepkt = [0x00] * 64
+            namepkt[0:4] = [0x02, 0x02, preset, 0x15]
+            namel = [ord(c) for c in name]
+            namepkt[4:4 + len(namel)] = namel
+            self._send_data(namepkt)
+
+        self._send_data(packet)
+
+        logger.debug('Saved settings for preset {0}: {1}'.format(preset, settings))
+
+    def _read_matching_packet(self, match, attempts=15):
+        '''Read packets directly from the device until one matching the
+        ``match`` predicate is found, or give up after ``attempts``
+        reads, raising NoDataAvailable.
+
+        This reads directly from the device rather than going through
+        read_data()/read_data_packet(), so it must only be used when
+        nothing else (e.g. an amp watcher thread) is concurrently
+        reading from the device - otherwise responses will be
+        randomly stolen between the two readers.
+
+        '''
+        for _ in range(attempts):
+            try:
+                pkt = self.device.read(self.interrupt_in, 64)
+            except usb.core.USBTimeoutError:
+                continue
+            except usb.core.USBError as e:
+                raise AmpDisconnectedError(str(e))
+            if match(pkt):
+                return pkt
+        raise NoDataAvailable('Timed out waiting for a matching response packet')
+
+    def get_preset_name_sync(self, preset, attempts=15):
+        '''Synchronously query and return the name of a single preset. See
+        _read_matching_packet for the concurrency caveat.
+
+        '''
+        if self.connected is False:
+            raise NotConnectedError
+
+        data = [0x00] * 64
+        data[0:4] = [0x02, 0x04, preset, 0x00]
+        self._send_data(data)
+        pkt = self._read_matching_packet(
+            lambda p: p[0] == 0x02 and p[1] == 0x04 and p[2] == preset)
+        namel = [c for c in pkt[4:25] if c > 0]
+        return ''.join(chr(c) for c in namel)
+
+    def get_preset_settings_sync(self, preset, attempts=15):
+        '''Synchronously query and return the settings of a single preset
+        as a BlackstarIDAmpPreset. See _read_matching_packet for the
+        concurrency caveat.
+
+        '''
+        if self.connected is False:
+            raise NotConnectedError
+
+        data = [0x00] * 64
+        data[0:4] = [0x02, 0x05, preset, 0x00]
+        self._send_data(data)
+        pkt = self._read_matching_packet(
+            lambda p: p[0] == 0x02 and p[1] == 0x05 and p[2] == preset)
+        return BlackstarIDAmpPreset.from_packet(pkt)
+
+    def read_all_presets(self):
+        '''Synchronously read the name and settings of every preset
+        (1..128) from the amp. Returns a dict keyed by preset number,
+        each value a dict with 'name' and 'settings' (a
+        BlackstarIDAmpPreset) keys.
+
+        This blocks for some time (~128 x 2 round trips) and must
+        only be called when nothing else is concurrently reading from
+        the device (e.g. pause any amp watcher thread first).
+
+        '''
+        presets = {}
+        for preset in range(1, 129):
+            name = self.get_preset_name_sync(preset)
+            settings = self.get_preset_settings_sync(preset)
+            presets[preset] = {'name': name, 'settings': settings}
+        return presets
+
+    def write_presets(self, presets):
+        '''Write a dict of presets (preset number -> {'name': ...,
+        'settings': ...}, as returned by import_presets_from_file) to
+        the amp.
+
+        '''
+        for preset, info in presets.items():
+            self.save_preset_settings(preset, info['settings'], name=info.get('name'))
+
     def select_preset(self, preset):
         '''Selects a preset.
 
@@ -696,8 +954,12 @@ class BlackstarIDAmp(object):
         '''
         try:
             packet = self.device.read(self.interrupt_in, 64)
-        except usb.core.USBError:
+        except usb.core.USBTimeoutError:
+            # Normal case - no data available right now
             raise NoDataAvailable
+        except usb.core.USBError as e:
+            logger.error('Lost connection to amplifier while reading: {0}'.format(e))
+            raise AmpDisconnectedError(str(e))
 
         if packet[0] == 0x02:
             if packet[1] == 0x04:
@@ -849,7 +1111,8 @@ class BlackstarIDAmp(object):
             # D  0B 32
             # G  04 32
             # B  08 32
-            note = self.tuner_note[packet[1]]
+            # packet[1] == 0 means no note is currently detected
+            note = self.tuner_note[packet[1] - 1] if packet[1] > 0 else None
             delta = 50 - packet[2]
             logger.debug(
                 'Data from amp:: tuner_note: {0} tuner_delta: {1}\n'.format(note, delta))
@@ -924,6 +1187,34 @@ class BlackstarIDAmp(object):
         ret = self.device.read(0x81, 64)
         logger.debug('Preset settings for preset {0}\n'.format(preset)
                      + self._format_data(ret))
+
+
+def export_presets_to_file(presets, filename):
+    '''Write a dict of presets (as returned by
+    BlackstarIDAmp.read_all_presets) to a JSON backup file.
+
+    '''
+    data = {}
+    for preset, info in presets.items():
+        data[str(preset)] = {
+            'name': info['name'],
+            'settings': info['settings'].to_settings_dict(),
+        }
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def import_presets_from_file(filename):
+    '''Read a JSON backup file written by export_presets_to_file and
+    return a dict keyed by preset number (int), each value a dict
+    with 'name' and 'settings' (a plain dict of control values,
+    suitable for BlackstarIDAmp.save_preset_settings) keys.
+
+    '''
+    with open(filename) as f:
+        data = json.load(f)
+    return {int(preset): info for preset, info in data.items()}
+
 
 if __name__ == '__main__':
     import logging

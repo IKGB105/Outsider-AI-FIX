@@ -16,11 +16,12 @@
 # Copyright 2015, Jonathan Underwood. All rights reserved.
 
 from PyQt5 import uic
-from PyQt5.QtCore import QObject, QThread, QMutex
+from PyQt5.QtCore import QObject, QThread, QMutex, Qt
 from PyQt5.QtCore import pyqtSlot, pyqtSignal
 from PyQt5.QtWidgets import QMainWindow, QMessageBox, QGroupBox, QSlider, QLCDNumber, QRadioButton, QListWidgetItem, QInputDialog
-from PyQt5.QtWidgets import QApplication
-from blackstarid import BlackstarIDAmp, NoDataAvailable, NotConnectedError
+from PyQt5.QtWidgets import QApplication, QFileDialog
+from blackstarid import BlackstarIDAmp, NoDataAvailable, NotConnectedError, AmpDisconnectedError
+from blackstarid.blackstarid import export_presets_to_file, import_presets_from_file, DEFAULT_PRESET_SETTINGS
 import logging
 import os
 
@@ -93,8 +94,10 @@ class Ui(QMainWindow):
         self.watcher_thread = None
 
         # For now we don't do anything with preset settings
-        # information other than store them in this list
-        self.preset_settings = [None] * 128
+        # information other than store them in this list. Presets are
+        # numbered 1..128 and indexed directly by preset_number below,
+        # so this needs 129 entries (index 0 is unused).
+        self.preset_settings = [None] * 129
 
         self.controls_enabled(False)
         self.show()
@@ -169,11 +172,25 @@ class Ui(QMainWindow):
         self.amp_mutex = QMutex()
         self.watcher = AmpControlWatcher(self.amp, self.amp_mutex)
         self.watcher.have_data.connect(self.new_data_from_amp)
+        self.watcher.amp_disconnected.connect(self.on_amp_disconnected)
         self.shutdown_threads.connect(self.watcher.stop_watching)
         self.watcher.moveToThread(self.watcher_thread)
         self.watcher_thread.started.connect(self.watcher.work)
 
         self.watcher_thread.start()
+
+    @pyqtSlot()
+    def on_amp_disconnected(self):
+        logger.error('Amplifier disconnected unexpectedly')
+        if self.watcher_thread is not None:
+            self.watcher_thread.quit()
+            self.watcher_thread.wait()
+        self.amp.reset_state()
+        self.controls_enabled(False)
+        self.connectToAmpButton.setText('Connect to Amp')
+        QMessageBox.warning(
+            self, 'Outsider',
+            'Lost connection to the amplifier. Check the USB cable/power and reconnect.')
 
     def closeEvent(self, event):
         # Ran when the application is closed.
@@ -422,16 +439,40 @@ class Ui(QMainWindow):
         logger.debug('manual_mode changed on amp: {0}'.format(value))
 
     def tuner_mode_changed_on_amp(self, value):
-        # TODO: Stub for now - needs hooking into a suitable tuner widget
         logger.debug('tuner_mode changed on amp: {0}'.format(value))
+        if value != 1:
+            # Left tuner mode - reset the display
+            self.reset_tuner_display()
 
     def tuner_note_changed_on_amp(self, value):
-        # TODO: Stub for now - needs hooking into a suitable tuner widget
         logger.debug('tuner_note changed on amp: {0}'.format(value))
+        self.tunerNoteLabel.setText(value if value is not None else '--')
+        if value is None:
+            self.tunerStatusLabel.setText('')
+            self.tunerStatusLabel.setStyleSheet('')
+            self.tunerMeter.setValue(50)
 
     def tuner_delta_changed_on_amp(self, value):
-        # TODO: Stub for now - needs hooking into a suitable tuner widget
         logger.debug('tuner_delta changed on amp: {0}'.format(value))
+        # value is positive when flat, negative when sharp, 0 when in tune
+        meter_value = min(max(50 - value, 0), 99)
+        self.tunerMeter.setValue(meter_value)
+
+        if abs(value) <= 2:
+            self.tunerStatusLabel.setText('In tune')
+            self.tunerStatusLabel.setStyleSheet('color: #00c000; font-weight: bold;')
+        elif value > 0:
+            self.tunerStatusLabel.setText('Flat')
+            self.tunerStatusLabel.setStyleSheet('color: #d00000; font-weight: bold;')
+        else:
+            self.tunerStatusLabel.setText('Sharp')
+            self.tunerStatusLabel.setStyleSheet('color: #d00000; font-weight: bold;')
+
+    def reset_tuner_display(self):
+        self.tunerNoteLabel.setText('--')
+        self.tunerStatusLabel.setText('')
+        self.tunerStatusLabel.setStyleSheet('')
+        self.tunerMeter.setValue(50)
 
     def resonance_changed_on_amp(self, value):
         self.resonanceSlider.blockSignals(True)
@@ -639,6 +680,65 @@ class Ui(QMainWindow):
         preset = idx + 1 # Presets are numbered from 1
         self.amp.select_preset(preset)
 
+    def gather_current_settings(self):
+        '''Read the current values of all front panel and effects
+        controls from the GUI widgets, returning a dict suitable for
+        passing to BlackstarIDAmp.save_preset_settings.
+
+        '''
+        return {
+            'voice': self.voiceComboBox.currentIndex(),
+            'gain': self.gainSlider.value(),
+            'volume': self.volumeSlider.value(),
+            'bass': self.bassSlider.value(),
+            'middle': self.middleSlider.value(),
+            'treble': self.trebleSlider.value(),
+            'isf': self.isfSlider.value(),
+            'tvp_switch': int(self.TVPRadioButton.isChecked()),
+            'tvp_valve': self.TVPComboBox.currentIndex(),
+            'mod_switch': int(self.modRadioButton.isChecked()),
+            'mod_type': self.modComboBox.currentIndex(),
+            'mod_segval': self.modSegValSlider.value(),
+            'mod_level': self.modLevelSlider.value(),
+            'mod_speed': self.modSpeedSlider.value(),
+            'mod_manual': self.modManualSlider.value(),
+            'delay_switch': int(self.delayRadioButton.isChecked()),
+            'delay_type': self.delayComboBox.currentIndex(),
+            'delay_feedback': self.delayFeedbackSlider.value(),
+            'delay_level': self.delayLevelSlider.value(),
+            'delay_time': self.delayTimeSlider.value(),
+            'reverb_switch': int(self.reverbRadioButton.isChecked()),
+            'reverb_type': self.reverbComboBox.currentIndex(),
+            'reverb_size': self.reverbSizeSlider.value(),
+            'reverb_level': self.reverbLevelSlider.value(),
+        }
+
+    @pyqtSlot()
+    def on_savePresetPushButton_clicked(self):
+        idx = self.presetNamesList.currentRow()
+        if idx < 0:
+            QMessageBox.information(
+                self, 'Outsider', 'Select a preset slot to save to first')
+            return
+
+        preset = idx + 1  # Presets are numbered from 1
+        item = self.presetNamesList.item(idx)
+        if item is not None and '. ' in item.text():
+            name = item.text().split('. ', 1)[1]
+        else:
+            name = 'Preset {0}'.format(preset)
+
+        settings = self.gather_current_settings()
+
+        # We need to grab the amp mutex to stop the amp watcher thread
+        # from consuming the packets emitted by the amp in the preset
+        # save process
+        self.amp_mutex.lock()
+        try:
+            self.amp.save_preset_settings(preset, settings, name)
+        finally:
+            self.amp_mutex.unlock()
+
     @pyqtSlot()
     def on_renamePresetPushButton_clicked(self):
         idx = self.presetNamesList.currentRow()
@@ -655,6 +755,88 @@ class Ui(QMainWindow):
             self.amp_mutex.lock()
             self.amp.set_preset_name(preset, name)
             self.amp_mutex.unlock()
+
+    @pyqtSlot()
+    def on_resetPresetPushButton_clicked(self):
+        idx = self.presetNamesList.currentRow()
+        if idx < 0:
+            QMessageBox.information(
+                self, 'Outsider', 'Select a preset slot to reset first')
+            return
+
+        preset = idx + 1  # Presets are numbered from 1
+
+        answer = QMessageBox.question(
+            self, 'Outsider',
+            'This will reset preset {0} to a blank state. This cannot be '
+            'undone. Continue?'.format(preset))
+        if answer != QMessageBox.Yes:
+            return
+
+        self.amp_mutex.lock()
+        try:
+            self.amp.save_preset_settings(
+                preset, DEFAULT_PRESET_SETTINGS, name='New Patch {0}'.format(preset))
+        finally:
+            self.amp_mutex.unlock()
+
+    @pyqtSlot()
+    def on_backupPresetsPushButton_clicked(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self, 'Backup all presets', 'outsider-presets-backup.json',
+            'Outsider preset backup (*.json)')
+        if not filename:
+            return
+
+        self.setCursor(Qt.WaitCursor)
+        self.amp_mutex.lock()
+        try:
+            presets = self.amp.read_all_presets()
+        except (NoDataAvailable, AmpDisconnectedError) as e:
+            self.unsetCursor()
+            self.amp_mutex.unlock()
+            QMessageBox.warning(
+                self, 'Outsider', 'Failed to read presets from the amp: {0}'.format(e))
+            return
+        self.amp_mutex.unlock()
+        self.unsetCursor()
+
+        export_presets_to_file(presets, filename)
+        QMessageBox.information(
+            self, 'Outsider', 'Saved all 128 presets to {0}'.format(filename))
+
+    @pyqtSlot()
+    def on_restorePresetsPushButton_clicked(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, 'Restore presets from backup', '',
+            'Outsider preset backup (*.json)')
+        if not filename:
+            return
+
+        try:
+            presets = import_presets_from_file(filename)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(
+                self, 'Outsider', 'Failed to read backup file: {0}'.format(e))
+            return
+
+        answer = QMessageBox.question(
+            self, 'Outsider',
+            'This will overwrite {0} preset(s) on the amp with the contents of '
+            '{1}. This cannot be undone. Continue?'.format(len(presets), filename))
+        if answer != QMessageBox.Yes:
+            return
+
+        self.setCursor(Qt.WaitCursor)
+        self.amp_mutex.lock()
+        try:
+            self.amp.write_presets(presets)
+        except (NoDataAvailable, AmpDisconnectedError) as e:
+            QMessageBox.warning(
+                self, 'Outsider', 'Failed to write presets to the amp: {0}'.format(e))
+        finally:
+            self.amp_mutex.unlock()
+            self.unsetCursor()
 
     # When the modulation type is changed, we want to change the label
     # associated with the segment value control. So, we need to define
@@ -703,6 +885,7 @@ class Ui(QMainWindow):
 
 class AmpControlWatcher(QObject):
     have_data = pyqtSignal(dict, name='have_data')
+    amp_disconnected = pyqtSignal(name='amp_disconnected')
     shutdown = False
 
     @pyqtSlot()
@@ -733,6 +916,14 @@ class AmpControlWatcher(QObject):
                 except NoDataAvailable:
                     self.amp_mutex.unlock()
                     logger.debug('No changes of amp controls reported')
+                    # Avoid spinning the CPU as fast as possible while
+                    # there's nothing to do
+                    QThread.msleep(20)
+                except AmpDisconnectedError:
+                    self.amp_mutex.unlock()
+                    logger.error('Amplifier appears to have been disconnected')
+                    self.shutdown = True
+                    self.amp_disconnected.emit()
                 else:
                     self.amp_mutex.unlock()
                     for control, value in settings.items():

@@ -2,10 +2,18 @@
 
 This software provides a GUI for controlling the Blackstar ID range of
 amplifiers, and is an alternative to Blackstar's own Insider
-software. It is primarily written for Linux, as the Blackstar Insider
+software. It is written for Linux, as the Blackstar Insider
 software is not available for that platform, but since it is written
 in Python it should work on any platform. Patches to support other
 platforms would be gratefully received.
+
+## About this fork
+
+This is a fork of Jonathan Underwood's original
+[outsider](https://github.com/jonathanunderwood/outsider) with a
+round of bug fixes and feature completions done with AI assistance
+(Claude), tested against a real Blackstar ID:15 TVP on Linux. See
+[CHANGES.md](CHANGES.md) for the details of what changed and why.
 
 # Screenshot
 
@@ -13,20 +21,28 @@ platforms would be gratefully received.
 
 ## Current status
 
-This software is usable, but still under heavy development.
+This software is usable, but still under development.
 
 Currently implemented:
 - Control of amplifier front panel controls
 - Control of amplifier effects
+- Selection of amplifier presets/patches
+- Saving of amplifier presets/patches
+- Resetting a preset to a blank state
+- Backing up all 128 presets to a file, and restoring them
+- Uploading a single preset from a file (e.g. one exported by Insider)
 
-To be implemented:
-- Selection of amplifier presets/patches [Work in progress]
-- Saving of amplifer presets/patches [Work in progress]
-- Uploading of presets/patches to amplifier [Work in progress]
-- Control for effects loop on/off [Not started yet]
-- Control for super-wide stereo on/off [Not started yet]
-- Control for noise gate setting [Not started yet]
-- Tuner [Not started yet]
+Not implemented, and not expected to be for most ID amps:
+- Tuner - the protocol appears to support it (see blackstarid.py), but
+  no ID amp we've tested exposes it over USB. If you have a model that
+  does, please get in touch.
+- Control for effects loop on/off, and super-wide stereo on/off -
+  these only apply to specific models (amps with an FX loop, and
+  stereo cabinet models respectively). Not applicable to single-speaker
+  mono combos like the ID:15 TVP.
+- Control for noise gate setting - blocked on reverse-engineering the
+  USB protocol for it, which requires capturing traffic from
+  Blackstar's own Insider software (Windows/Mac only).
 
 Out of scope:
 - Firmware updating
