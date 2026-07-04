@@ -123,7 +123,8 @@ The program was written by Jonathan Underwood
 (jonathan.underwood@gmail.com), and the following people have made
 valuable contributions:
 
-- Rhys Yarranton 
+- Rhys Yarranton
+- [IKGB105](https://github.com/IKGB105) (this fork: bug fixes and preset management features, AI-assisted)
 
 # License
 
