@@ -40,10 +40,6 @@ Connected, live:
 
 ![Skin, connected to a real ID:15 TVP](./screenshot-skin-connected.png?raw=true "Skin, connected")
 
-# Screenshot
-
-![A screenshot to whet your apetite:](./outsider-screenshot.png?raw=true "Screenshot")
-
 ## Current status
 
 This software is usable, but still under development.
