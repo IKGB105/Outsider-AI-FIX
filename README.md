@@ -15,6 +15,31 @@ round of bug fixes and feature completions done with AI assistance
 (Claude), tested against a real Blackstar ID:15 TVP on Linux. See
 [CHANGES.md](CHANGES.md) for the details of what changed and why.
 
+## Photo-realistic skin
+
+Alongside the classic control panel, this fork adds an optional
+visual skin: a photo of the amp's real front panel with clickable,
+turnable knobs and LEDs placed directly over their actual positions.
+Drag a knob in the photo and it drives the amp exactly like the
+classic slider next to it - both stay in sync no matter which one you
+use.
+
+**The skin itself is built specifically for the Blackstar ID:15
+TVP** - the photo and every knob/LED coordinate are measured against
+that exact model's panel, so it won't line up right on other ID
+amps. Everything the skin sits on top of (all the classic
+sliders/dials/comboboxes) is untouched and still works generically
+across the ID range for basic control, same as upstream - just the
+photo overlay is ID:15 TVP-only for now.
+
+Disconnected:
+
+![Skin, not connected to an amp](./screenshot-skin-disconnected.png?raw=true "Skin, disconnected")
+
+Connected, live:
+
+![Skin, connected to a real ID:15 TVP](./screenshot-skin-connected.png?raw=true "Skin, connected")
+
 # Screenshot
 
 ![A screenshot to whet your apetite:](./outsider-screenshot.png?raw=true "Screenshot")

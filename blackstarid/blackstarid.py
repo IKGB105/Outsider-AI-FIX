@@ -441,26 +441,28 @@ class BlackstarIDAmp(object):
 
         self.reattach_kernel = [False] * cfg.bNumInterfaces
 
-        # for intf in range(cfg.bNumInterfaces):
-        for intf in cfg:
-            if dev.is_kernel_driver_active(intf.bInterfaceNumber):
-                try:
-                    dev.detach_kernel_driver(intf.bInterfaceNumber)
-                except usb.core.USBError as e:
-                    raise usb.core.USBError(
-                        "Could not detach kernel driver from interface({0}): {1}".format(intf.bInterfaceNumber, str(e)))
-                # Note that for interfaces with more than one setting
-                # we'll iterate more than once through that
-                # interface. The second and later times it won't be
-                # attached to the kernel so we won't reach here, but
-                # it's ok, as on the first time we set this to be
-                # True. Be careful with alternative strategies - it
-                # would be very easy to overwrite the True below with
-                # False on the second pass!
-                self.reattach_kernel[intf.bInterfaceNumber] = True
+        # Only interface 0 (the interrupt endpoints we talk to below) is
+        # ours to take. On ID-TVP amps the other interfaces are a USB
+        # Audio class device (snd-usb-audio) - detaching those too, as a
+        # blanket loop over every interface used to do, silently kills
+        # the amp's audio output system-wide (e.g. in OBS) for as long as
+        # Outsider stays connected, even though we never touch them.
+        control_intf = 0
+        if dev.is_kernel_driver_active(control_intf):
+            try:
+                dev.detach_kernel_driver(control_intf)
+            except usb.core.USBError as e:
+                raise usb.core.USBError(
+                    "Could not detach kernel driver from interface({0}): {1}".format(control_intf, str(e)))
+            self.reattach_kernel[control_intf] = True
 
-        # Set the device to use the default (and only) configuration
-        dev.set_configuration()
+        # dev.reset() above already made the kernel re-apply the same (and
+        # only) configuration on its own. Calling set_configuration() again
+        # here requires libusb to have every interface on the device free
+        # (Resource busy otherwise) - fine when we used to detach all of
+        # them, but incompatible with leaving the audio interfaces owned by
+        # snd-usb-audio. It is redundant, so skip it instead of re-detaching
+        # everything just to satisfy it.
 
         # Interface 0 seems always to be the interrupt endpoint
         # interface

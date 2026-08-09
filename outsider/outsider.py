@@ -16,12 +16,13 @@
 # Copyright 2015, Jonathan Underwood. All rights reserved.
 
 from PyQt5 import uic
-from PyQt5.QtCore import QObject, QThread, QMutex, Qt
+from PyQt5.QtCore import QObject, QThread, QMutex, Qt, QSettings
 from PyQt5.QtCore import pyqtSlot, pyqtSignal
 from PyQt5.QtWidgets import QMainWindow, QMessageBox, QGroupBox, QSlider, QLCDNumber, QRadioButton, QListWidgetItem, QInputDialog
-from PyQt5.QtWidgets import QApplication, QFileDialog
+from PyQt5.QtWidgets import QApplication, QFileDialog, QWidget, QVBoxLayout, QLabel
 from blackstarid import BlackstarIDAmp, NoDataAvailable, NotConnectedError, AmpDisconnectedError
 from blackstarid.blackstarid import export_presets_to_file, import_presets_from_file, DEFAULT_PRESET_SETTINGS
+from outsider.amp_skin import AmpSkinPanel
 import logging
 import os
 
@@ -75,9 +76,6 @@ class Ui(QMainWindow):
             'fx_focus': self.fx_focus_changed_on_amp,
             'preset': self.preset_changed_on_amp,
             'manual_mode': self.manual_mode_changed_on_amp,
-            'tuner_mode': self.tuner_mode_changed_on_amp,
-            'tuner_note': self.tuner_note_changed_on_amp,
-            'tuner_delta': self.tuner_delta_changed_on_amp,
             'resonance': self.resonance_changed_on_amp,
             'presence': self.presence_changed_on_amp,
             'master_volume': self.master_volume_changed_on_amp,
@@ -99,11 +97,138 @@ class Ui(QMainWindow):
         # so this needs 129 entries (index 0 is unused).
         self.preset_settings = [None] * 129
 
+        # Photo-realistic skin for the ID:15 TVP panel. It only mirrors
+        # the classic controls below (see amp_skin.py) - never talks to
+        # the amp itself - so it's purely additive. Rather than editing
+        # the Designer-built centralwidget's grid layout directly (easy
+        # to subtly break), the whole existing centralwidget is
+        # reparented, as-is, into a new container below the skin.
+        self.ampSkin = AmpSkinPanel(
+            sliders={
+                'gainSlider': self.gainSlider,
+                'volumeSlider': self.volumeSlider,
+                'bassSlider': self.bassSlider,
+                'trebleSlider': self.trebleSlider,
+                'isfSlider': self.isfSlider,
+            },
+            selectors={
+                'voiceComboBox': self.voiceComboBox,
+                'TVPComboBox': self.TVPComboBox,
+            },
+            radios={
+                'modRadioButton': self.modRadioButton,
+                'delayRadioButton': self.delayRadioButton,
+                'reverbRadioButton': self.reverbRadioButton,
+                'TVPRadioButton': self.TVPRadioButton,
+            },
+        )
+        self.ampSkin.hideDuplicatesCheckbox.toggled.connect(self.hide_duplicate_controls)
+        self.ampSkin.hideDuplicatesCheckbox.toggled.connect(self._save_hide_duplicates_setting)
+        # The photo dial stays turnable regardless of TVP being enabled -
+        # a real knob is never locked by a mode switch, and pre-selecting
+        # a valve type before enabling TVP (now via the photo's own TVP
+        # footswitch button, mirrored to TVPRadioButton above) is harmless.
+
+        # groupBox (the whole "Amp controls" box: Gain/Volume/Bass/Middle/
+        # Treble/ISF) is one QGridLayout - hiding individual widgets inside
+        # it leaves their columns behind as blank space, since QGridLayout
+        # doesn't reclaim space from widgets that are merely invisible.
+        # Rather than fight that layout, hide the whole groupBox and swap
+        # in this compact, Middle-only replacement (a fresh mirror of
+        # middleSlider, same two-way pattern as everywhere else here) in
+        # its exact grid cell - so the row genuinely shrinks instead of
+        # leaving a hole.
+        self.middleCompact = QWidget()
+        middle_layout = QVBoxLayout(self.middleCompact)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        middle_lcd = QLCDNumber()
+        middle_lcd.setMaximumWidth(60)
+        middle_slider = QSlider(Qt.Vertical)
+        middle_slider.setMaximum(self.middleSlider.maximum())
+        middle_slider.setValue(self.middleSlider.value())
+        middle_slider.setMinimumHeight(120)
+        middle_slider.setMaximumHeight(120)
+        middle_label = QLabel('Middle')
+        middle_label.setAlignment(Qt.AlignHCenter)
+        middle_layout.addWidget(middle_lcd, 0, Qt.AlignHCenter)
+        middle_layout.addWidget(middle_slider, 0, Qt.AlignHCenter)
+        middle_layout.addWidget(middle_label, 0, Qt.AlignHCenter)
+        middle_slider.valueChanged.connect(middle_lcd.display)
+        middle_slider.valueChanged.connect(self.middleSlider.setValue)
+        self.middleSlider.valueChanged.connect(middle_slider.setValue)
+
+        # Same grid cell groupBox occupies (see outsider.ui) - only one of
+        # the two is ever visible, so this doesn't conflict with it.
+        self.centralwidget.layout().addWidget(self.middleCompact, 1, 0, 2, 2)
+        self.middleCompact.setVisible(False)
+
+        # Restore last session's "hide duplicate controls" choice now that
+        # middleCompact/groupBox_5/TVPComboBox above all exist - setChecked
+        # applies it immediately via the toggled connections made earlier.
+        saved_hidden = QSettings('Outsider', 'Outsider').value(
+            'ampSkin/hideDuplicateControls', False, type=bool)
+        self.ampSkin.hideDuplicatesCheckbox.setChecked(saved_hidden)
+
+        classic_controls = self.centralwidget
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(self.ampSkin)
+        container_layout.addWidget(classic_controls)
+        self.setCentralWidget(container)
+
         self.controls_enabled(False)
         self.show()
 
+    def hide_duplicate_controls(self, hidden):
+        '''The skin's checkbox: hides the classic Gain/Volume/Bass/Treble/
+        ISF controls (the whole groupBox) once you're using their
+        photo-knob equivalents instead, swapping in the compact
+        Middle-only replacement so the row actually shrinks instead of
+        leaving a blank gap. Middle itself stays controllable either way
+        - the real ID:15 TVP panel has no Middle knob, so there's no
+        photo equivalent to switch to.
+
+        Voice (groupBox_5) and TVP (groupBox_6, combo AND the Enable
+        radio button - now mirrored by the photo's own TVP footswitch
+        LED button) are both fully duplicated by the photo, so both
+        hide outright.
+
+        With groupBox/groupBox_5/groupBox_6 all gone, rows 1-2 have
+        nothing left in columns 0-2 - so Modulation/Delay/Reverb (row 3)
+        move up into that freed space, and Middle moves out of their old
+        way, next to Presets, instead of sitting alone up top.'''
+        self.groupBox.setVisible(not hidden)
+        self.groupBox_5.setVisible(not hidden)
+        self.groupBox_6.setVisible(not hidden)
+        self.middleCompact.setVisible(hidden)
+
+        grid = self.centralwidget.layout()
+        for widget in (self.middleCompact, self.groupBox_2, self.groupBox_3, self.groupBox_4):
+            grid.removeWidget(widget)
+
+        if hidden:
+            grid.addWidget(self.groupBox_2, 1, 0)
+            grid.addWidget(self.groupBox_3, 1, 1)
+            grid.addWidget(self.groupBox_4, 1, 2)
+            grid.addWidget(self.middleCompact, 5, 3)
+        else:
+            grid.addWidget(self.groupBox_2, 3, 0)
+            grid.addWidget(self.groupBox_3, 3, 1)
+            grid.addWidget(self.groupBox_4, 3, 2)
+            grid.addWidget(self.middleCompact, 1, 0, 2, 2)
+
+    def _save_hide_duplicates_setting(self, hidden):
+        QSettings('Outsider', 'Outsider').setValue('ampSkin/hideDuplicateControls', hidden)
+
     def controls_enabled(self, bool):
         # Disable/Enable all widgets except the connect button (always enabled) and the master controls (always disabled)
+        # ampSkin lives in its own window, outside the QGroupBox tree
+        # this method otherwise walks, so it needs its own explicit call.
+        self.ampSkin.setEnabled(bool)
+
         if bool is True:
             widgets = self.findChildren(QGroupBox)#(QObject)
             for w in widgets:
@@ -213,24 +338,28 @@ class Ui(QMainWindow):
         self.voiceComboBox.blockSignals(True)
         self.voiceComboBox.setCurrentIndex(value)
         self.voiceComboBox.blockSignals(False)
+        self.ampSkin.sync_from_amp('voiceComboBox', value)
 
     def gain_changed_on_amp(self, value):
         self.gainSlider.blockSignals(True)
         self.gainSlider.setValue(value)
         self.gainLcdNumber.display(value)
         self.gainSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('gainSlider', value)
 
     def volume_changed_on_amp(self, value):
         self.volumeSlider.blockSignals(True)
         self.volumeSlider.setValue(value)
         self.volumeLcdNumber.display(value)
         self.volumeSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('volumeSlider', value)
 
     def bass_changed_on_amp(self, value):
         self.bassSlider.blockSignals(True)
         self.bassSlider.setValue(value)
         self.bassLcdNumber.display(value)
         self.bassSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('bassSlider', value)
 
     def middle_changed_on_amp(self, value):
         self.middleSlider.blockSignals(True)
@@ -243,12 +372,14 @@ class Ui(QMainWindow):
         self.trebleSlider.setValue(value)
         self.trebleLcdNumber.display(value)
         self.trebleSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('trebleSlider', value)
 
     def isf_changed_on_amp(self, value):
         self.isfSlider.blockSignals(True)
         self.isfSlider.setValue(value)
         self.isfLcdNumber.display(value)
         self.isfSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('isfSlider', value)
 
     def tvp_switch_changed_on_amp(self, value):
         value = bool(value)
@@ -261,6 +392,7 @@ class Ui(QMainWindow):
         self.TVPComboBox.blockSignals(True)
         self.TVPComboBox.setCurrentIndex(value)
         self.TVPComboBox.blockSignals(False)
+        self.ampSkin.sync_from_amp('TVPComboBox', value)
 
     def mod_switch_changed_on_amp(self, value):
         value = bool(value)
@@ -438,42 +570,6 @@ class Ui(QMainWindow):
             pass
         logger.debug('manual_mode changed on amp: {0}'.format(value))
 
-    def tuner_mode_changed_on_amp(self, value):
-        logger.debug('tuner_mode changed on amp: {0}'.format(value))
-        if value != 1:
-            # Left tuner mode - reset the display
-            self.reset_tuner_display()
-
-    def tuner_note_changed_on_amp(self, value):
-        logger.debug('tuner_note changed on amp: {0}'.format(value))
-        self.tunerNoteLabel.setText(value if value is not None else '--')
-        if value is None:
-            self.tunerStatusLabel.setText('')
-            self.tunerStatusLabel.setStyleSheet('')
-            self.tunerMeter.setValue(50)
-
-    def tuner_delta_changed_on_amp(self, value):
-        logger.debug('tuner_delta changed on amp: {0}'.format(value))
-        # value is positive when flat, negative when sharp, 0 when in tune
-        meter_value = min(max(50 - value, 0), 99)
-        self.tunerMeter.setValue(meter_value)
-
-        if abs(value) <= 2:
-            self.tunerStatusLabel.setText('In tune')
-            self.tunerStatusLabel.setStyleSheet('color: #00c000; font-weight: bold;')
-        elif value > 0:
-            self.tunerStatusLabel.setText('Flat')
-            self.tunerStatusLabel.setStyleSheet('color: #d00000; font-weight: bold;')
-        else:
-            self.tunerStatusLabel.setText('Sharp')
-            self.tunerStatusLabel.setStyleSheet('color: #d00000; font-weight: bold;')
-
-    def reset_tuner_display(self):
-        self.tunerNoteLabel.setText('--')
-        self.tunerStatusLabel.setText('')
-        self.tunerStatusLabel.setStyleSheet('')
-        self.tunerMeter.setValue(50)
-
     def resonance_changed_on_amp(self, value):
         self.resonanceSlider.blockSignals(True)
         self.resonanceSlider.setValue(value)
@@ -493,6 +589,7 @@ class Ui(QMainWindow):
         self.masterVolumeSlider.setValue(value)
         self.masterVolumeLcdNumber.display(value)
         self.masterVolumeSlider.blockSignals(False)
+        self.ampSkin.sync_from_amp('masterVolumeSlider', value)
         logger.debug('master_volume changed on amp: {0}'.format(value))
 
     ##################################################################
